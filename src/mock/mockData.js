@@ -235,7 +235,7 @@ function generateSensors({ ts, phase, rand }) {
   // Vibration RMS
   let vibrationRms;
   if (phase.includes("to_")) vibrationRms = 0.35 + rand() * 0.35;
-  else if (phase.startsWith("stop")) vibrationRms = 0.12 + rand() * 0.1;
+  else if (phase.startsWith("stop")) vibrationRms = 0.12 + rand() * 0.10;
   else vibrationRms = 0.03 + rand() * 0.05;
 
   // Weekend effect
@@ -298,9 +298,7 @@ export function generateMockData({
   const rand = mulberry32(seed);
 
   const start =
-    startDate instanceof Date
-      ? new Date(startDate)
-      : new Date(Date.now() - days * 24 * 60 * 60000);
+    startDate instanceof Date ? new Date(startDate) : new Date(Date.now() - days * 24 * 60 * 60000);
 
   const { end, legs } = buildCycleTimeline(start, days);
 

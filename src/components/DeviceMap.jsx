@@ -1,20 +1,16 @@
 // src/components/DeviceMap.jsx
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useMemo } from "react";
 import { MapContainer, TileLayer, Polyline, CircleMarker, Tooltip, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-}
 
 function FitBounds({ latlngs, enabled }) {
   const map = useMap();
 
-  useEffect(() => {
+  React.useEffect(() => {
     if (!enabled) return;
     if (!latlngs || latlngs.length < 2) return;
     try {
-      map.fitBounds(latlngs, { padding: [28, 28] });
+      map.fitBounds(latlngs, { padding: [25, 25] });
     } catch {
       // ignore
     }
@@ -23,37 +19,31 @@ function FitBounds({ latlngs, enabled }) {
   return null;
 }
 
-function FollowLast({ last, enabled }) {
+function FollowLast({ lastLatLng, enabled }) {
   const map = useMap();
-  const lastRef = useRef(null);
 
-  useEffect(() => {
+  React.useEffect(() => {
     if (!enabled) return;
-    if (!last) return;
-
-    // Avoid spamming panTo when last hasn't changed
-    const key = `${last[0].toFixed(6)}:${last[1].toFixed(6)}`;
-    if (lastRef.current === key) return;
-    lastRef.current = key;
-
+    if (!lastLatLng) return;
     try {
-      map.panTo(last, { animate: true });
+      // keep zoom, just pan
+      map.panTo(lastLatLng, { animate: true });
     } catch {
       // ignore
     }
-  }, [map, last, enabled]);
+  }, [map, lastLatLng, enabled]);
 
   return null;
 }
 
-function chunkByImpact(sampled, impactThresholdG) {
-  // Split route polyline into segments so impacted segments can be colored red.
-  // A segment is "hot" if either endpoint has impact >= threshold.
-  if (!sampled || sampled.length < 2) return [];
+function chunkRouteByImpact(sampled, incidentThresholdG) {
+  // Returns [{positions: [[lat,lon]...], isHot: boolean}]
+  // We mark a segment "hot" if either endpoint has impact >= threshold.
+  if (sampled.length < 2) return [];
 
   const segs = [];
   let cur = {
-    hot: (sampled[0].impactG ?? 0) >= impactThresholdG,
+    isHot: (sampled[0].impactG ?? 0) >= incidentThresholdG,
     positions: [[sampled[0].lat, sampled[0].lon]],
   };
 
@@ -61,14 +51,13 @@ function chunkByImpact(sampled, impactThresholdG) {
     const prev = sampled[i - 1];
     const p = sampled[i];
 
-    const hot =
-      ((prev.impactG ?? 0) >= impactThresholdG) || ((p.impactG ?? 0) >= impactThresholdG);
+    const hot = ((prev.impactG ?? 0) >= incidentThresholdG) || ((p.impactG ?? 0) >= incidentThresholdG);
 
-    // if hotness flips, close current and start a new segment
-    if (hot !== cur.hot) {
-      cur.positions.push([p.lat, p.lon]); // keep continuity
+    // if state changes, close current and start new, ensuring continuity
+    if (hot !== cur.isHot) {
+      cur.positions.push([p.lat, p.lon]);
       segs.push(cur);
-      cur = { hot, positions: [[p.lat, p.lon]] };
+      cur = { isHot: hot, positions: [[p.lat, p.lon]] };
     } else {
       cur.positions.push([p.lat, p.lon]);
     }
@@ -80,110 +69,106 @@ function chunkByImpact(sampled, impactThresholdG) {
 
 export default function DeviceMap({
   points = [],
-  incidents = [],
+  height = 420,
 
-  impactThresholdG = 2.0,
-
-  // Route density: use every nth point (1 = all)
-  nth = 1,
-
-  // Toggles
-  showDots = true,
+  // display options
+  showRoute = true,
+  showRouteDots = true,
+  showLast = true,
   showIncidents = true,
   followLast = false,
 
-  // Map behavior
-  autoFit = true,
-  height = 420,
+  // route density
+  routeEveryNth = 1, // 1 = all
+
+  // incident thresholds
+  incidentThresholdG = 2.0,
+
+  // behavior
+  autoFit = true, // fit bounds on load/change
+
+  // tooltip
+  formatTooltip,
 }) {
   const normalized = useMemo(() => {
-    const arr = (points || [])
+    return (points || [])
       .map((p) => ({
-        ts: p.ts ? new Date(p.ts) : null,
+        ts: p.ts instanceof Date ? p.ts : new Date(p.ts),
         lat: Number(p.lat),
         lon: Number(p.lon),
         impactG: Number(p.impactG ?? 0),
+        tempC: p.tempC,
+        rhPct: p.rhPct,
       }))
       .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lon))
-      .sort((a, b) => (a.ts?.getTime?.() ?? 0) - (b.ts?.getTime?.() ?? 0));
-
-    return arr;
+      .sort((a, b) => a.ts - b.ts);
   }, [points]);
 
-  const effectiveNth = useMemo(() => Math.max(1, Number(nth || 1)), [nth]);
+  const defaultCenter = [51.9244, 4.4777]; // Rotterdam
 
   const sampled = useMemo(() => {
-    if (effectiveNth === 1) return normalized;
-    return normalized.filter((_, idx) => idx % effectiveNth === 0 || idx === normalized.length - 1);
-  }, [normalized, effectiveNth]);
+    const n = Math.max(1, Number(routeEveryNth || 1));
+    if (n === 1) return normalized;
+    return normalized.filter((_, idx) => idx % n === 0 || idx === normalized.length - 1);
+  }, [normalized, routeEveryNth]);
 
   const latlngs = useMemo(() => sampled.map((p) => [p.lat, p.lon]), [sampled]);
 
-  const last = useMemo(() => {
-    if (!normalized.length) return null;
-    const p = normalized[normalized.length - 1];
-    return [p.lat, p.lon];
-  }, [normalized]);
-
-  const routeChunks = useMemo(() => chunkByImpact(sampled, impactThresholdG), [sampled, impactThresholdG]);
-
-  const incidentMarkers = useMemo(() => {
+  const incidents = useMemo(() => {
     if (!showIncidents) return [];
-    const arr = (incidents && incidents.length ? incidents : normalized).filter(
-      (p) => Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lon)) && Number(p.impactG ?? 0) >= impactThresholdG
-    );
+    return normalized.filter((p) => (p.impactG ?? 0) >= incidentThresholdG);
+  }, [normalized, showIncidents, incidentThresholdG]);
 
-    // Dedupe by timestamp if present
-    const seen = new Set();
-    return arr
-      .map((p) => ({
-        ts: p.ts ? new Date(p.ts) : null,
-        lat: Number(p.lat),
-        lon: Number(p.lon),
-        impactG: Number(p.impactG ?? 0),
-      }))
-      .filter((p) => {
-        const k = p.ts ? p.ts.toISOString() : `${p.lat}:${p.lon}:${p.impactG}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      })
-      .sort((a, b) => (a.ts?.getTime?.() ?? 0) - (b.ts?.getTime?.() ?? 0));
-  }, [incidents, normalized, showIncidents, impactThresholdG]);
+  const last = normalized.length ? normalized[normalized.length - 1] : null;
+  const lastLatLng = last ? [last.lat, last.lon] : null;
 
-  const center = normalized.length ? [normalized[0].lat, normalized[0].lon] : [51.9244, 4.4777];
+  const routeChunks = useMemo(() => {
+    if (!showRoute) return [];
+    return chunkRouteByImpact(sampled, incidentThresholdG);
+  }, [showRoute, sampled, incidentThresholdG]);
+
+  const tooltipText = (p) => {
+    if (formatTooltip) return formatTooltip(p);
+    return `${p.ts.toISOString()} • ${p.lat.toFixed(4)}, ${p.lon.toFixed(4)} • impact ${Number(p.impactG ?? 0).toFixed(2)}g`;
+  };
 
   return (
-    <div style={{ height, width: "100%" }}>
-      <MapContainer center={center} zoom={6} style={{ height: "100%", width: "100%" }} scrollWheelZoom>
+    <div style={{ height, borderRadius: 12, overflow: "hidden" }}>
+      <MapContainer
+        center={normalized.length ? [normalized[0].lat, normalized[0].lon] : defaultCenter}
+        zoom={6}
+        style={{ height: "100%", width: "100%" }}
+        scrollWheelZoom
+      >
         <TileLayer
           attribution='&copy; OpenStreetMap contributors'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
         {latlngs.length >= 2 && <FitBounds latlngs={latlngs} enabled={autoFit && !followLast} />}
-        <FollowLast last={last} enabled={followLast} />
+        <FollowLast lastLatLng={lastLatLng} enabled={followLast} />
 
-        {/* Route line (split into red/blue chunks around incidents) */}
-        {routeChunks.map((c, idx) => (
-          <Polyline
-            key={`chunk-${idx}`}
-            positions={c.positions}
-            pathOptions={{
-              weight: 4,
-              opacity: 0.95,
-              color: c.hot ? "rgba(255,80,80,0.95)" : "rgba(80,170,255,0.95)",
-            }}
-          />
-        ))}
+        {/* Route with impact-aware coloring */}
+        {showRoute &&
+          routeChunks.map((c, idx) => (
+            <Polyline
+              key={`route-chunk-${idx}`}
+              positions={c.positions}
+              pathOptions={{
+                weight: 4,
+                opacity: 0.95,
+                color: c.isHot ? "rgba(255,80,80,0.95)" : "rgba(80,170,255,0.95)",
+              }}
+            />
+          ))}
 
         {/* Route dots */}
-        {showDots &&
+        {showRouteDots &&
           sampled.map((p, idx) => {
-            const over = (p.impactG ?? 0) >= impactThresholdG;
+            const over = (p.impactG ?? 0) >= incidentThresholdG;
             return (
               <CircleMarker
-                key={`dot-${p.ts ? p.ts.toISOString() : idx}`}
+                key={`route-dot-${p.ts.toISOString()}-${idx}`}
                 center={[p.lat, p.lon]}
                 radius={over ? 5 : 3.5}
                 pathOptions={{
@@ -191,23 +176,23 @@ export default function DeviceMap({
                   opacity: 1,
                   fillOpacity: 0.85,
                   color: "rgba(0,0,0,0.25)",
-                  fillColor: over ? "rgba(255,80,80,0.95)" : "rgba(255,255,255,0.92)",
+                  fillColor: over ? "rgba(255,80,80,0.95)" : "rgba(255,255,255,0.9)",
                 }}
               >
                 <Tooltip direction="top" offset={[0, -8]} opacity={1}>
-                  {(p.ts ? p.ts.toISOString() : "—") + ` • ${p.lat.toFixed(4)}, ${p.lon.toFixed(4)} • ${p.impactG.toFixed(2)}g`}
+                  {tooltipText(p)}
                 </Tooltip>
               </CircleMarker>
             );
           })}
 
-        {/* Incidents (bigger red dots) */}
+        {/* Incident markers (bigger red) */}
         {showIncidents &&
-          incidentMarkers.map((p, idx) => (
+          incidents.map((p, idx) => (
             <CircleMarker
-              key={`inc-${p.ts ? p.ts.toISOString() : idx}`}
+              key={`impact-${p.ts.toISOString()}-${idx}`}
               center={[p.lat, p.lon]}
-              radius={9}
+              radius={8}
               pathOptions={{
                 weight: 2,
                 opacity: 1,
@@ -217,15 +202,15 @@ export default function DeviceMap({
               }}
             >
               <Tooltip direction="top" offset={[0, -10]} opacity={1}>
-                {(p.ts ? p.ts.toISOString() : "—") + ` • IMPACT ${p.impactG.toFixed(2)}g`}
+                {tooltipText(p)}
               </Tooltip>
             </CircleMarker>
           ))}
 
-        {/* Last position highlight */}
-        {last && (
+        {/* Last location */}
+        {showLast && last && (
           <CircleMarker
-            center={last}
+            center={[last.lat, last.lon]}
             radius={11}
             pathOptions={{
               weight: 3,
@@ -236,7 +221,7 @@ export default function DeviceMap({
             }}
           >
             <Tooltip direction="top" offset={[0, -12]} opacity={1}>
-              Last position
+              {`Last • ${tooltipText(last)}`}
             </Tooltip>
           </CircleMarker>
         )}
