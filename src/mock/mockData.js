@@ -1,358 +1,227 @@
 // src/mock/mockData.js
-// PURE JS ONLY (NO JSX). Safe for Vite.
-// Demo generator for CargoSys IoT tracking.
-//
-// Features:
-// - Route cycle repeating:
-//   Rotterdam -> Tilburg (1h)
-//   Stop Tilburg (4h)
-//   Tilburg -> Budapest (32h)
-//   Rest Budapest (48h)
-//   Budapest -> Tilburg (32h)
-//   Stop Tilburg (4h)
-//   Tilburg -> Rotterdam (1h)
-//   Rest Rotterdam (48h)
-// - Sampling ~ every 30 minutes with ±3 min jitter
-// - GPS jitter up to 1 km per sample
-// - Impact: small bump during Tilburg stop, big drop + aftershocks during Tilburg->Budapest
-// - Vibration RMS and dominant frequency (Hz)
-// - Battery % drains over ~90 days, monotonic decreasing
+// 2 months demo series (~30 min interval with ±3 min jitter)
+// Adds:
+// - Refrigerated transport: step-drop in temperature when cooling turns on
+// - Weekend effect: lower vibration on Sat/Sun
+// - Rain period: higher humidity across multiple days
+// - Exactly 1 small bump + 1 big drop with aftershock
 
 function mulberry32(seed) {
-  let t = seed >>> 0;
+  let a = seed >>> 0;
   return function () {
-    t += 0x6D2B79F5;
-    let r = Math.imul(t ^ (t >>> 15), 1 | t);
-    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+    a |= 0;
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-function hashStringToSeed(str) {
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
+function toIsoZ(d) {
+  return d.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function lerp(a, b, t) {
-  return a + (b - a) * t;
+function daysBetween(a, b) {
+  return (a.getTime() - b.getTime()) / (24 * 60 * 60 * 1000);
 }
 
-function deg2rad(d) {
-  return (d * Math.PI) / 180;
-}
-
-function addMinutes(date, mins) {
-  return new Date(date.getTime() + mins * 60000);
-}
-
-function minutesBetween(a, b) {
-  return Math.max(0, Math.round((b.getTime() - a.getTime()) / 60000));
-}
-
-function isWeekend(d) {
-  const day = d.getDay();
-  return day === 0 || day === 6;
-}
-
-function hourOfDay(d) {
-  return d.getHours() + d.getMinutes() / 60;
-}
-
-// Random displacement within circle of radius maxKm
-function addGpsJitterKm(lat, lon, rand, maxKm = 1.0) {
-  const r = Math.sqrt(rand()) * maxKm; // km
-  const theta = rand() * 2 * Math.PI;
-
-  // ~km per degree latitude
-  const dLat = (r * Math.cos(theta)) / 111.32;
-  const dLon = (r * Math.sin(theta)) / (111.32 * Math.cos(deg2rad(lat)) + 1e-9);
-
-  return { lat: lat + dLat, lon: lon + dLon };
-}
-
-// Waypoints (to avoid straight line)
-const WP = {
-  rotterdam: { lat: 51.9244, lon: 4.4777 },
-  dordrecht: { lat: 51.8133, lon: 4.6901 },
-  breda: { lat: 51.5719, lon: 4.7683 },
-  tilburg: { lat: 51.5606, lon: 5.0919 },
-  eindhoven: { lat: 51.4416, lon: 5.4697 },
-  venlo: { lat: 51.3704, lon: 6.1724 },
-  cologne: { lat: 50.9375, lon: 6.9603 },
-  frankfurt: { lat: 50.1109, lon: 8.6821 },
-  nuremberg: { lat: 49.4521, lon: 11.0767 },
-  vienna: { lat: 48.2082, lon: 16.3738 },
-  budapest: { lat: 47.4979, lon: 19.0402 },
-};
-
-const ROUTE_RTM_TO_TILBURG = [WP.rotterdam, WP.dordrecht, WP.breda, WP.tilburg];
-const ROUTE_TILBURG_TO_BUDAPEST = [
-  WP.tilburg,
-  WP.eindhoven,
-  WP.venlo,
-  WP.cologne,
-  WP.frankfurt,
-  WP.nuremberg,
-  WP.vienna,
-  WP.budapest,
-];
-const ROUTE_BUDAPEST_TO_TILBURG = [...ROUTE_TILBURG_TO_BUDAPEST].reverse();
-const ROUTE_TILBURG_TO_RTM = [...ROUTE_RTM_TO_TILBURG].reverse();
-
-function buildSegmentPolyline(routePoints, steps, rand, jitterKm) {
-  const pts = [];
-  if (routePoints.length < 2 || steps <= 1) return pts;
-
-  // weight segment steps by rough distance
-  const segLens = [];
-  let total = 0;
-  for (let i = 0; i < routePoints.length - 1; i++) {
-    const a = routePoints[i];
-    const b = routePoints[i + 1];
-    const dLat = (b.lat - a.lat) * 111.32;
-    const dLon = (b.lon - a.lon) * 111.32 * Math.cos(deg2rad((a.lat + b.lat) / 2));
-    const dist = Math.sqrt(dLat * dLat + dLon * dLon);
-    segLens.push(dist);
-    total += dist;
-  }
-
-  let remaining = steps;
-  for (let i = 0; i < routePoints.length - 1; i++) {
-    const a = routePoints[i];
-    const b = routePoints[i + 1];
-
-    const segSteps =
-      i === routePoints.length - 2
-        ? remaining
-        : Math.max(2, Math.round((segLens[i] / total) * steps));
-
-    remaining -= segSteps;
-
-    for (let s = 0; s < segSteps; s++) {
-      const t = s / (segSteps - 1);
-      const lat = lerp(a.lat, b.lat, t);
-      const lon = lerp(a.lon, b.lon, t);
-      pts.push(addGpsJitterKm(lat, lon, rand, jitterKm));
-    }
-  }
-
-  return pts;
-}
-
-function buildStopPoints(location, steps, rand, jitterKm) {
-  const pts = [];
-  for (let i = 0; i < steps; i++) {
-    pts.push(addGpsJitterKm(location.lat, location.lon, rand, jitterKm));
-  }
-  return pts;
-}
-
-function buildGpsForLeg(type, steps, rand, jitterKm) {
-  switch (type) {
-    case "rtm_to_tilburg":
-      return buildSegmentPolyline(ROUTE_RTM_TO_TILBURG, steps, rand, jitterKm);
-    case "tilburg_to_budapest":
-      return buildSegmentPolyline(ROUTE_TILBURG_TO_BUDAPEST, steps, rand, jitterKm);
-    case "budapest_to_tilburg":
-      return buildSegmentPolyline(ROUTE_BUDAPEST_TO_TILBURG, steps, rand, jitterKm);
-    case "tilburg_to_rtm":
-      return buildSegmentPolyline(ROUTE_TILBURG_TO_RTM, steps, rand, jitterKm);
-    case "stop_tilburg":
-    case "stop_tilburg_2":
-      return buildStopPoints(WP.tilburg, steps, rand, jitterKm);
-    case "rest_budapest":
-      return buildStopPoints(WP.budapest, steps, rand, jitterKm);
-    case "rest_rtm":
-      return buildStopPoints(WP.rotterdam, steps, rand, jitterKm);
-    default:
-      return buildStopPoints(WP.rotterdam, steps, rand, jitterKm);
-  }
-}
-
-function buildCycleTimeline(startDate, daysTotal) {
-  const start = new Date(startDate);
-  const end = addMinutes(start, daysTotal * 24 * 60);
-
-  const legsDef = [
-    { type: "rtm_to_tilburg", mins: 60 },
-    { type: "stop_tilburg", mins: 240 },
-    { type: "tilburg_to_budapest", mins: 32 * 60 },
-    { type: "rest_budapest", mins: 48 * 60 },
-    { type: "budapest_to_tilburg", mins: 32 * 60 },
-    { type: "stop_tilburg_2", mins: 240 },
-    { type: "tilburg_to_rtm", mins: 60 },
-    { type: "rest_rtm", mins: 48 * 60 },
-  ];
-
-  const legs = [];
-  let t = new Date(start);
-
-  while (t < end) {
-    for (const l of legsDef) {
-      const t2 = addMinutes(t, l.mins);
-      legs.push({ type: l.type, from: new Date(t), to: new Date(t2) });
-      t = t2;
-      if (t >= end) break;
-    }
-  }
-
-  return { start, end, legs };
-}
-
-function generateSensors({ ts, phase, rand }) {
-  const hod = hourOfDay(ts);
-  const weekend = isWeekend(ts);
-
-  // Temperature: bigger swings, koeltransport colder while long driving
-  const dayWave = Math.sin(((hod - 6) / 24) * 2 * Math.PI);
-  let tempC = 6 + 2.8 * dayWave + (rand() - 0.5) * 0.8;
-
-  if (phase === "tilburg_to_budapest" || phase === "budapest_to_tilburg") {
-    tempC -= 1.4 + rand() * 0.4; // reefer running
-  }
-  if (phase.startsWith("stop") || phase.startsWith("rest")) {
-    tempC += 0.7 + rand() * 0.5; // drift up slightly
-  }
-
-  // Humidity: night higher + multi-day rain spell
-  const nightHumid = Math.cos(((hod - 3) / 24) * 2 * Math.PI);
-  let rhPct = 58 + 12 * nightHumid + (rand() - 0.5) * 4.0;
-
-  const dayIndex = Math.floor(ts.getTime() / (24 * 3600 * 1000));
-  const inRain = dayIndex % 14 >= 6 && dayIndex % 14 <= 9;
-  if (inRain) rhPct += 12 + rand() * 5;
-
-  rhPct = clamp(rhPct, 35, 98);
-
-  // Vibration RMS
-  let vibrationRms;
-  if (phase.includes("to_")) vibrationRms = 0.35 + rand() * 0.35;
-  else if (phase.startsWith("stop")) vibrationRms = 0.12 + rand() * 0.10;
-  else vibrationRms = 0.03 + rand() * 0.05;
-
-  // Weekend effect
-  if (weekend) vibrationRms *= 0.55;
-
-  // Dominant frequency
-  let vibrationHz;
-  if (phase.includes("to_")) vibrationHz = 18 + rand() * 37;
-  else if (phase.startsWith("stop")) vibrationHz = 6 + rand() * 12;
-  else vibrationHz = rand() * 6;
-
-  if (weekend) vibrationHz *= 0.7;
-
-  // Slight correlation: higher RMS => slightly higher Hz
-  vibrationHz += vibrationRms * (8 + rand() * 8);
-
-  return {
-    tempC: Number(tempC.toFixed(2)),
-    rhPct: Number(rhPct.toFixed(1)),
-    vibrationRms: Number(clamp(vibrationRms, 0, 2).toFixed(3)),
-    vibrationHz: Number(clamp(vibrationHz, 0, 120).toFixed(1)),
-  };
-}
-
-function generateImpactG({ ts, phase, rand, impactThresholdG }) {
-  // baseline near zero
-  let impactG = 0.02 + rand() * 0.08;
-
-  // Small bump once during Tilburg stop (loading pallet)
-  if (phase === "stop_tilburg" || phase === "stop_tilburg_2") {
-    const minuteInBlock = ts.getHours() * 60 + ts.getMinutes();
-    // deterministic-ish: happens at minute 20 modulo the stop length
-    if (minuteInBlock % 240 === 20) {
-      impactG = impactThresholdG + 0.35 + rand() * 0.2; // ~2.35..2.55
-    }
-  }
-
-  // Big drop + aftershocks on Tilburg->Budapest
-  if (phase === "tilburg_to_budapest") {
-    const minuteOfDay = ts.getHours() * 60 + ts.getMinutes();
-    if (minuteOfDay % (24 * 60) === 11) impactG = 7.8 + rand() * 1.8; // big fall
-    if (minuteOfDay % (24 * 60) === 41) impactG = 2.4 + rand() * 0.6; // aftershock
-    if (minuteOfDay % (24 * 60) === 71) impactG = 1.6 + rand() * 0.4; // settling
-  }
-
-  return Number(impactG.toFixed(2));
-}
-
-export function generateMockData({
-  trackingCode = "CS-DEMO",
-  days = 60,
-  sampleMinutes = 30,
-  sampleJitterMinutes = 3,
-  gpsJitterKm = 1.0,
-  impactThresholdG = 2.0,
-  startDate = null,
-  batteryDrainDays = 90, // ~3 months for 2xAAA in your story
+function generateMockReadings({
+  startIso = "2026-01-01T06:00:00Z",
+  endIso = "2026-03-01T10:20:00Z",
+  seed = 1337
 } = {}) {
-  const seed = hashStringToSeed(trackingCode);
   const rand = mulberry32(seed);
 
-  const start =
-    startDate instanceof Date ? new Date(startDate) : new Date(Date.now() - days * 24 * 60 * 60000);
+  const start = new Date(startIso);
+  const end = new Date(endIso);
 
-  const { end, legs } = buildCycleTimeline(start, days);
+  const baseStepMs = 30 * 60 * 1000;
+  const jitterMs = 3 * 60 * 1000;
 
-  const points = [];
-  let lastBatteryPct = 100;
+  // ---------- Scenarios timing ----------
+  // Cooling turns on around day 10 (morning)
+  const coolingOnAt = new Date(start.getTime() + 10 * 24 * 60 * 60 * 1000 + 8 * 60 * 60 * 1000);
 
-  for (const leg of legs) {
-    const legMins = minutesBetween(leg.from, leg.to);
-    const steps = Math.max(2, Math.round(legMins / sampleMinutes));
+  // Rain period: day 18 -> day 23 (inclusive-ish)
+  const rainStart = new Date(start.getTime() + 18 * 24 * 60 * 60 * 1000);
+  const rainEnd = new Date(start.getTime() + 23 * 24 * 60 * 60 * 1000);
 
-    const gpsPts = buildGpsForLeg(leg.type, steps, rand, gpsJitterKm);
+  // Impact events
+  const smallBumpAt = new Date(start.getTime() + 3 * 24 * 60 * 60 * 1000 + 4 * 60 * 60 * 1000);
+  const bigDropAt = new Date(start.getTime() + 28 * 24 * 60 * 60 * 1000 + 9 * 60 * 60 * 1000);
+  const aftershockTimesSec = [20, 40, 60];
 
-    for (let i = 0; i < steps; i++) {
-      const ideal = addMinutes(leg.from, Math.round((i / (steps - 1)) * legMins));
-      const jitter = Math.round((rand() * 2 - 1) * sampleJitterMinutes);
-      const ts = addMinutes(ideal, jitter);
+  // ---------- Event map (ensure exact points exist) ----------
+  const eventMap = new Map();
+  eventMap.set(toIsoZ(smallBumpAt), { type: "small" });
+  eventMap.set(toIsoZ(bigDropAt), { type: "drop" });
+  aftershockTimesSec.forEach((s, idx) => {
+    eventMap.set(toIsoZ(new Date(bigDropAt.getTime() + s * 1000)), { type: "aftershock", idx });
+  });
 
-      if (ts < start || ts > end) continue;
+  // ---------- Base levels ----------
+  let baseTemp = 7.0; // avg ambient
+  let baseRh = 50;
 
-      const gps = gpsPts[i] || gpsPts[gpsPts.length - 1];
-      const sensors = generateSensors({ ts, phase: leg.type, rand });
-      const impactG = generateImpactG({ ts, phase: leg.type, rand, impactThresholdG });
+  // Cooling parameters
+  // When cooling turns on, target temp drops by ~5°C and stabilizes.
+  const coolingDrop = 5.0;
+  const coolingStabilizeHours = 6; // how quickly it reaches new level
 
-      // Battery: ideal linear drain with small noise, but monotonic decreasing
-      const elapsedDays = (ts.getTime() - start.getTime()) / (24 * 3600 * 1000);
-      const idealPct = 100 * (1 - elapsedDays / batteryDrainDays);
-      const noisyPct = idealPct + (rand() - 0.5) * 1.2; // ±0.6%
-      const pct = clamp(noisyPct, 0, 100);
-      const batteryPct = Math.min(lastBatteryPct, pct);
-      lastBatteryPct = batteryPct;
+  // Rain parameters (adds humidity offset during rain, with ramp in/out)
+  const rainMaxBoost = 12; // extra RH at peak rain
 
-      // Optional voltage (indicative)
-      const batteryV = 3.0 + (batteryPct / 100) * 0.6 + (rand() - 0.5) * 0.02;
+  function dayNightPhase(dt) {
+    // Peak around 14:00, low around 04:00
+    const h = dt.getUTCHours();
+    return Math.sin(((h - 4) / 24) * 2 * Math.PI);
+  }
 
-      points.push({
-        ts: ts.toISOString(),
-        trackingCode,
+  function rainBoost(dt) {
+    if (dt < rainStart || dt > rainEnd) return 0;
 
-        lat: Number(gps.lat.toFixed(6)),
-        lon: Number(gps.lon.toFixed(6)),
+    // Smooth ramp in/out: first and last day are smaller boost
+    const totalDays = Math.max(1, daysBetween(rainEnd, rainStart));
+    const d = daysBetween(dt, rainStart);
 
-        tempC: sensors.tempC,
-        rhPct: sensors.rhPct,
+    // 0..1..0 bell-ish curve across the rain window
+    const x = clamp(d / totalDays, 0, 1);
+    const bell = Math.sin(Math.PI * x); // 0 at edges, 1 in middle
 
+    return rainMaxBoost * bell;
+  }
+
+  function coolingFactor(dt) {
+    if (dt <= coolingOnAt) return 0;
+
+    // approach 1 as time passes (exponential-ish with hours)
+    const hours = (dt.getTime() - coolingOnAt.getTime()) / (60 * 60 * 1000);
+    const k = clamp(hours / coolingStabilizeHours, 0, 1);
+    // smoothstep for nicer curve
+    return k * k * (3 - 2 * k);
+  }
+
+  function isWeekend(dt) {
+    const dow = dt.getUTCDay(); // 0=Sun, 6=Sat
+    return dow === 0 || dow === 6;
+  }
+
+  function isDriving(dt) {
+    const h = dt.getUTCHours();
+    // Weekday driving window 06-18; weekends much less
+    if (isWeekend(dt)) return rand() > 0.92; // very rare on weekend
+    return h >= 6 && h <= 18 && rand() > 0.25;
+  }
+
+  const readings = [];
+  let t = new Date(start);
+
+  while (t <= end) {
+    const jitter = Math.round((rand() * 2 - 1) * jitterMs);
+    const tj = new Date(t.getTime() + jitter);
+
+    const phase = dayNightPhase(tj); // -1 night, +1 day-ish
+    const coolF = coolingFactor(tj);
+    const rainF = rainBoost(tj);
+
+    // Temperature:
+    // - bigger day/night swing
+    // - after cooling: whole curve shifted down
+    // - some random noise
+    const tempAmbient =
+      baseTemp +
+      phase * 3.2 +            // day/night swing
+      (rand() - 0.5) * 0.6;    // noise
+
+    const temp = tempAmbient - coolF * coolingDrop;
+
+    // Humidity:
+    // - inverse of day/night phase (night higher)
+    // - rain period boosts RH over multiple days
+    // - some noise
+    const rh =
+      baseRh -
+      phase * 10 +             // night more humid
+      rainF +                  // rain boost (multi-day)
+      (rand() - 0.5) * 3;
+
+    // Vibration:
+    // - higher when driving
+    // - weekends mostly low
+    let vibHz;
+    if (isDriving(tj)) {
+      vibHz = Math.round(18 + rand() * 20); // 18–38
+    } else {
+      vibHz = Math.round(5 + rand() * 7);   // 5–12
+    }
+
+    // Background impact (very low)
+    let impactG = 0.12 + rand() * 0.25;
+    if (rand() < 0.02) impactG += rand() * 0.4;
+
+    // Apply planned impacts if timestamp matches
+    const key = toIsoZ(tj);
+    const evt = eventMap.get(key);
+
+    if (evt?.type === "small") {
+      impactG = 2.4; // small bump while loading
+      vibHz = 12;
+    } else if (evt?.type === "drop") {
+      impactG = 9.8; // pallet fell
+      vibHz = 7;
+    } else if (evt?.type === "aftershock") {
+      const levels = [1.6, 1.1, 0.7];
+      impactG = levels[evt.idx] ?? 0.7;
+      vibHz = 9 + evt.idx * 2;
+    }
+
+    readings.push({
+      ts: key,
+      temp: Number(clamp(temp, -2, 15).toFixed(1)),
+      rh: Math.round(clamp(rh, 35, 85)),
+      impactG: Number(impactG.toFixed(2)),
+      vibHz
+    });
+
+    t = new Date(t.getTime() + baseStepMs);
+  }
+
+  // Ensure exact event timestamps exist even if jitter missed them
+  for (const [iso, evt] of eventMap.entries()) {
+    if (!readings.find((r) => r.ts === iso)) {
+      const nearest = readings.reduce((a, b) =>
+        Math.abs(new Date(a.ts) - new Date(iso)) < Math.abs(new Date(b.ts) - new Date(iso)) ? a : b
+      );
+
+      let impactG = nearest.impactG;
+      let vibHz = nearest.vibHz;
+
+      if (evt.type === "small") {
+        impactG = 2.4; vibHz = 12;
+      } else if (evt.type === "drop") {
+        impactG = 9.8; vibHz = 7;
+      } else if (evt.type === "aftershock") {
+        const levels = [1.6, 1.1, 0.7];
+        impactG = levels[evt.idx] ?? 0.7;
+        vibHz = 9 + evt.idx * 2;
+      }
+
+      readings.push({
+        ts: iso,
+        temp: nearest.temp,
+        rh: nearest.rh,
         impactG,
-        vibrationRms: sensors.vibrationRms,
-        vibrationHz: sensors.vibrationHz,
-
-        batteryPct: Number(batteryPct.toFixed(1)),
-        batteryV: Number(clamp(batteryV, 2.8, 3.65).toFixed(2)),
+        vibHz
       });
     }
   }
 
-  points.sort((a, b) => new Date(a.ts) - new Date(b.ts));
-  return points;
+  readings.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+  return readings;
 }
+
+export const mockReadings = generateMockReadings();
