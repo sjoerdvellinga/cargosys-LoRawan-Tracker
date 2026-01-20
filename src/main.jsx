@@ -3,6 +3,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import Track from "./pages/Track.jsx";
+import "leaflet/dist/leaflet.css";
 
 function AppShell() {
   return (
