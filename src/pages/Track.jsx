@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   LineChart,
   Line,
@@ -9,23 +9,21 @@ import {
   ResponsiveContainer,
   Legend,
   ReferenceLine,
-  Dot
+  Dot,
 } from "recharts";
 import { Link } from "react-router-dom";
 
-import { mockReadings } from "../mock/mockData.js";
-import { downloadCsv } from "../utils/csv.js";
-import { fetchDeviceReadings } from "../api/client.js";
+import { fetchTrackingData } from "../api/trackingApi";
+import { downloadCsv } from "../utils/csv";
 
-/** ---------- Helpers (self-contained) ---------- **/
+/* ---------- Helpers ---------- */
 
 function formatTick(date) {
-  // date is a Date object
   return date.toLocaleString("nl-NL", {
     day: "2-digit",
     month: "2-digit",
     hour: "2-digit",
-    minute: "2-digit"
+    minute: "2-digit",
   });
 }
 
@@ -36,7 +34,7 @@ function formatTooltip(date) {
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit"
+    second: "2-digit",
   });
 }
 
@@ -44,12 +42,12 @@ function normalizeReadings(readings, impactThresholdG) {
   return readings.map((d) => {
     const impactG = Number(d.impactG);
     return {
-      ts: new Date(d.ts), // Date object for axis formatting
-      temp: Number(d.temp),
-      rh: Number(d.rh),
+      ts: new Date(d.ts),
+      temp: Number(d.tempC ?? d.temp),
+      rh: Number(d.rhPct ?? d.rh),
       impactG,
-      vibHz: Number(d.vibHz),
-      impactExceeded: impactG >= Number(impactThresholdG)
+      vibHz: Number(d.vibrationHz ?? d.vibHz),
+      impactExceeded: impactG >= impactThresholdG,
     };
   });
 }
@@ -64,188 +62,216 @@ function filterByRange(readings, fromDate, toDate) {
   });
 }
 
-/**
- * Downsample time-series to a max number of points.
- * Bucket by time, keep first + maxImpact + last per bucket to preserve spikes.
- */
 function downsample(readings, maxPoints = 250) {
   if (!Array.isArray(readings) || readings.length <= maxPoints) return readings;
 
   const sorted = [...readings].sort((a, b) => new Date(a.ts) - new Date(b.ts));
-  const n = sorted.length;
+  const bucketSize = Math.ceil(sorted.length / maxPoints);
 
-  const start = new Date(sorted[0].ts).getTime();
-  const end = new Date(sorted[n - 1].ts).getTime();
-  const span = Math.max(1, end - start);
-
-  const bucketCount = Math.min(Number(maxPoints) || 250, n);
-  const bucketMs = Math.ceil(span / bucketCount);
-
-  const buckets = new Map();
-  for (const r of sorted) {
-    const t = new Date(r.ts).getTime();
-    const key = Math.floor((t - start) / bucketMs);
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(r);
+  const sampled = [];
+  for (let i = 0; i < sorted.length; i += bucketSize) {
+    const bucket = sorted.slice(i, i + bucketSize);
+    bucket.sort((a, b) => Number(b.impactG) - Number(a.impactG));
+    sampled.push(bucket[0]); // meest impactvolle punt uit bucket
   }
 
-  const picked = [];
-  for (const arr of buckets.values()) {
-    const first = arr[0];
-    const last = arr[arr.length - 1];
-
-    let maxImpact = arr[0];
-    for (const r of arr) {
-      if (Number(r.impactG) > Number(maxImpact.impactG)) maxImpact = r;
-    }
-
-    picked.push(first, maxImpact, last);
-  }
-
-  // de-dupe (coarse)
-  const seen = new Set();
-  const unique = [];
-  for (const r of picked) {
-    const k = `${r.ts}|${r.temp}|${r.rh}|${r.impactG}|${r.vibHz}`;
-    if (!seen.has(k)) {
-      seen.add(k);
-      unique.push(r);
-    }
-  }
-
-  unique.sort((a, b) => new Date(a.ts) - new Date(b.ts));
-  return unique;
+  sampled.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+  return sampled;
 }
 
-function applyPreset(preset, baseReadings) {
-  const sorted = [...baseReadings].sort((a, b) => new Date(a.ts) - new Date(b.ts));
-  const end = sorted.length ? new Date(sorted[sorted.length - 1].ts) : new Date();
+function applyPreset(preset, readings) {
+  if (!readings.length) return { from: "", to: "" };
+
+  const sorted = [...readings].sort((a, b) => new Date(a.ts) - new Date(b.ts));
+  const end = new Date(sorted[sorted.length - 1].ts);
   let start = null;
 
-  if (preset === "24h") start = new Date(end.getTime() - 24 * 60 * 60 * 1000);
-  if (preset === "7d") start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
-  if (preset === "30d") start = new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
+  if (preset === "24h") start = new Date(end.getTime() - 24 * 3600 * 1000);
+  if (preset === "7d") start = new Date(end.getTime() - 7 * 24 * 3600 * 1000);
+  if (preset === "30d") start = new Date(end.getTime() - 30 * 24 * 3600 * 1000);
 
   return {
     from: start ? start.toISOString().slice(0, 16) : "",
-    to: end.toISOString().slice(0, 16)
+    to: end.toISOString().slice(0, 16),
   };
 }
 
-function ImpactDot(props) {
-  const { cx, cy, payload } = props;
-  if (cx == null || cy == null) return null;
+function ImpactDot({ cx, cy, payload }) {
   if (!payload?.impactExceeded) return null;
   return <Dot cx={cx} cy={cy} r={4} fill="#ff4d4f" stroke="none" />;
 }
 
-/** ---------- Component ---------- **/
+/* ---------- Component ---------- */
 
 export default function Track() {
-  const [code, setCode] = useState("");
+  const inputRef = useRef(null);
+
+  const [trackingCode, setTrackingCode] = useState("");
   const [status, setStatus] = useState("idle"); // idle | loading | ready
-  const [errorMsg, setErrorMsg] = useState("");
-  const [isDemo, setIsDemo] = useState(false);
+  const [error, setError] = useState("");
   const [readings, setReadings] = useState([]);
 
-  // Range + performance + thresholds
   const [rangePreset, setRangePreset] = useState("24h"); // 24h | 7d | 30d | custom
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [maxPoints, setMaxPoints] = useState(250);
   const [impactThresholdG, setImpactThresholdG] = useState(2.0);
 
-  async function onView() {
-    const trimmed = code.trim();
-    if (!trimmed) return;
+  const [dataSource, setDataSource] = useState("api"); // api | mock
+  const chartHeight = window.innerWidth < 600 ? 260 : 320;
+
+  const LAST_CODE_KEY = "cargosys:lastTrackingCode";
+  const [autoLoaded, setAutoLoaded] = useState(false);
+
+  // Load last code once
+  useEffect(() => {
+    const saved = localStorage.getItem(LAST_CODE_KEY);
+    if (saved && !trackingCode && !autoLoaded) {
+      setTrackingCode(saved);
+      setAutoLoaded(true);
+
+      // Auto-load (na state update)
+      setTimeout(() => {
+        onView(saved);
+      }, 0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoLoaded]);
+
+  async function onView(forcedCode) {
+    const code = (forcedCode ?? trackingCode).trim();
+    if (!code) return;
+
+    localStorage.setItem(LAST_CODE_KEY, code);
 
     setStatus("loading");
-    setErrorMsg("");
-    setIsDemo(false);
+    setError("");
 
     try {
-      const apiReadings = await fetchDeviceReadings(trimmed);
-      setReadings(apiReadings);
+      const result = await fetchTrackingData({
+        trackingCode: code,
+        // Optioneel later:
+        // from: rangePreset === "custom" ? from : undefined,
+        // to: rangePreset === "custom" ? to : undefined,
+      });
+
+      const data = result?.data ?? result; // extra defensief
+      const source = result?.source ?? "api";
+
+      setReadings(Array.isArray(data) ? data : []);
+      setDataSource(source);
 
       if (rangePreset !== "custom") {
-        const p = applyPreset(rangePreset, apiReadings);
+        const p = applyPreset(rangePreset, Array.isArray(data) ? data : []);
         setFrom(p.from);
         setTo(p.to);
       }
 
       setStatus("ready");
+
+      // Zorg dat je daarna weer kunt typen (handig op iOS/Android)
+      setTimeout(() => {
+        inputRef.current?.focus?.();
+      }, 0);
     } catch (err) {
-      // fallback to mock data
-      setIsDemo(true);
-      setReadings(mockReadings);
-
-      if (rangePreset !== "custom") {
-        const p = applyPreset(rangePreset, mockReadings);
-        setFrom(p.from);
-        setTo(p.to);
-      }
-
-      const msg =
-        err?.code === "NO_API"
-          ? "API is not configured yet — showing demo data."
-          : "Could not load live data — showing demo data.";
-
-      setErrorMsg(msg);
-      setStatus("ready");
+      console.error(err);
+      setError("Could not load tracking data.");
+      setStatus("idle");
     }
   }
 
   const processed = useMemo(() => {
     if (!readings.length) return [];
-    const filtered = filterByRange(readings, from || null, to || null);
+    const filtered = filterByRange(readings, from, to);
     const sampled = downsample(filtered, Number(maxPoints) || 250);
     return normalizeReadings(sampled, Number(impactThresholdG) || 2.0);
   }, [readings, from, to, maxPoints, impactThresholdG]);
 
   function onDownload() {
-    const trimmed = code.trim() || "demo";
     if (!processed.length) return;
 
-    // For CSV we prefer raw-ish fields, convert Date -> ISO
     const rows = processed.map((d) => ({
       ts: d.ts.toISOString(),
       temp: d.temp,
       rh: d.rh,
       impactG: d.impactG,
-      vibHz: d.vibHz
+      vibHz: d.vibHz,
     }));
 
-    downloadCsv(`cargosys-${trimmed}.csv`, rows);
+    const safeCode = (trackingCode || "demo").trim() || "demo";
+    downloadCsv(`cargosys-${safeCode}.csv`, rows);
   }
 
   return (
-    <div style={{ padding: "60px", fontFamily: "Arial" }}>
+    <div className="app">
       <h1>Track a device</h1>
-      <p>Enter your tracking code to view sensor data.</p>
 
-      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
         <input
-          placeholder="Tracking code (e.g. CS-4K8F-21A)"
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          style={{ padding: "10px 12px", minWidth: "280px" }}
+          ref={inputRef}
+          placeholder="Tracking code"
+          value={trackingCode}
+          onChange={(e) => setTrackingCode(e.target.value)}
+          autoCorrect="off"
+          autoCapitalize="none"
+          spellCheck={false}
+          inputMode="text"
+          style={{
+            padding: "10px 12px",
+            fontSize: "16px", // voorkomt iOS input-zoom
+            borderRadius: "10px",
+            border: "1px solid rgba(255,255,255,0.2)",
+            background: "rgba(255,255,255,0.06)",
+            color: "#fff",
+            outline: "none",
+            minWidth: 240,
+          }}
         />
 
-        <button onClick={onView} disabled={status === "loading"} style={{ padding: "10px 12px" }}>
-          {status === "loading" ? "Loading..." : "View data"}
+        <button
+          type="button"
+          onClick={() => onView()}
+          disabled={status === "loading"}
+          style={{
+            padding: "10px 14px",
+            fontSize: "16px",
+            borderRadius: "10px",
+            border: "1px solid rgba(255,255,255,0.2)",
+            background: "rgba(255,255,255,0.12)",
+            color: "#fff",
+            cursor: status === "loading" ? "not-allowed" : "pointer",
+            opacity: status === "loading" ? 0.7 : 1,
+          }}
+        >
+          {status === "loading" ? "Loading…" : "View data"}
         </button>
 
-        <button onClick={onDownload} disabled={!processed.length} style={{ padding: "10px 12px" }}>
+        <button
+          type="button"
+          onClick={onDownload}
+          disabled={!processed.length}
+          style={{
+            padding: "10px 14px",
+            fontSize: "16px",
+            borderRadius: "10px",
+            border: "1px solid rgba(255,255,255,0.2)",
+            background: "rgba(255,255,255,0.12)",
+            color: "#fff",
+            cursor: !processed.length ? "not-allowed" : "pointer",
+            opacity: !processed.length ? 0.6 : 1,
+          }}
+        >
           Download CSV
         </button>
 
-        {isDemo && (
+        {dataSource === "mock" && (
           <span
             style={{
               padding: "6px 10px",
               borderRadius: "999px",
               background: "rgba(255,255,255,0.12)",
-              fontSize: "12px"
+              fontSize: "12px",
+              marginLeft: "8px",
             }}
           >
             Demo data
@@ -253,107 +279,12 @@ export default function Track() {
         )}
       </div>
 
-      {errorMsg && <p style={{ marginTop: "14px", opacity: 0.9 }}>{errorMsg}</p>}
-
-      {status === "idle" && <p style={{ marginTop: "20px" }}>Fill in a tracking code to load data.</p>}
-
-      {status === "ready" && (
-        <div
-          style={{
-            marginTop: "18px",
-            padding: "14px",
-            background: "rgba(255,255,255,0.06)",
-            borderRadius: "12px"
-          }}
-        >
-          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
-            <label>
-              Range:&nbsp;
-              <select
-                value={rangePreset}
-                onChange={(e) => {
-                  const preset = e.target.value;
-                  setRangePreset(preset);
-
-                  if (preset !== "custom") {
-                    const p = applyPreset(preset, readings);
-                    setFrom(p.from);
-                    setTo(p.to);
-                  }
-                }}
-              >
-                <option value="24h">Last 24h</option>
-                <option value="7d">Last 7d</option>
-                <option value="30d">Last 30d</option>
-                <option value="custom">Custom</option>
-              </select>
-            </label>
-
-            <label>
-              From:&nbsp;
-              <input
-                type="datetime-local"
-                value={from}
-                onChange={(e) => {
-                  setFrom(e.target.value);
-                  setRangePreset("custom");
-                }}
-                disabled={rangePreset !== "custom"}
-              />
-            </label>
-
-            <label>
-              To:&nbsp;
-              <input
-                type="datetime-local"
-                value={to}
-                onChange={(e) => {
-                  setTo(e.target.value);
-                  setRangePreset("custom");
-                }}
-                disabled={rangePreset !== "custom"}
-              />
-            </label>
-          </div>
-
-          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center", marginTop: "12px" }}>
-            <label>
-              Max points:&nbsp;
-              <input
-                type="number"
-                min="50"
-                max="2000"
-                step="50"
-                value={maxPoints}
-                onChange={(e) => setMaxPoints(e.target.value)}
-                style={{ width: "110px" }}
-              />
-            </label>
-
-            <label>
-              Impact threshold (g):&nbsp;
-              <input
-                type="number"
-                min="0.5"
-                max="50"
-                step="0.1"
-                value={impactThresholdG}
-                onChange={(e) => setImpactThresholdG(e.target.value)}
-                style={{ width: "90px" }}
-              />
-            </label>
-
-            <span style={{ opacity: 0.9 }}>
-              Showing <b>{processed.length}</b> points
-            </span>
-          </div>
-        </div>
-      )}
+      {error && <p style={{ color: "#ff6b6b" }}>{error}</p>}
 
       {status === "ready" && processed.length > 0 && (
         <>
-          <h2 style={{ marginTop: "28px" }}>Temperature & Humidity</h2>
-          <ResponsiveContainer width="100%" height={320}>
+          <h2>Temperature & Humidity</h2>
+          <ResponsiveContainer width="100%" height={chartHeight}>
             <LineChart data={processed}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="ts" tickFormatter={formatTick} minTickGap={24} />
@@ -365,21 +296,19 @@ export default function Track() {
             </LineChart>
           </ResponsiveContainer>
 
-          <h2 style={{ marginTop: "28px" }}>Impact & Vibration</h2>
-          <ResponsiveContainer width="100%" height={320}>
+          <h2>Impact & Vibration</h2>
+          <ResponsiveContainer width="100%" height={chartHeight}>
             <LineChart data={processed}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis dataKey="ts" tickFormatter={formatTick} minTickGap={24} />
               <YAxis />
               <Tooltip labelFormatter={formatTooltip} />
               <Legend />
-
               <ReferenceLine
                 y={Number(impactThresholdG)}
-                label={`Impact threshold (${impactThresholdG}g)`}
                 strokeDasharray="4 4"
+                label={`Threshold ${impactThresholdG}g`}
               />
-
               <Line type="monotone" dataKey="impactG" name="Impact g" dot={<ImpactDot />} />
               <Line type="monotone" dataKey="vibHz" name="Vibration Hz" dot={false} />
             </LineChart>
@@ -387,8 +316,8 @@ export default function Track() {
         </>
       )}
 
-      <p style={{ marginTop: "40px" }}>
-        <Link to="/">← Back to home</Link>
+      <p style={{ marginTop: 32 }}>
+        <Link to="/">← Back</Link>
       </p>
     </div>
   );

@@ -1,8 +1,68 @@
+html,
+body,
+#root {
+  height: 100%;
+}
+
+:root {
+  /* iOS/Android safe-area variabelen (worden 0 op devices zonder notch) */
+  --safe-top: env(safe-area-inset-top);
+  --safe-right: env(safe-area-inset-right);
+  --safe-bottom: env(safe-area-inset-bottom);
+  --safe-left: env(safe-area-inset-left);
+}
+
 body {
   margin: 0;
   background: #0b1f3d;
   color: #ffffff;
+
+  /* Belangrijk: voorkom iOS “auto text zoom” en rare viewport scaling */
+  -webkit-text-size-adjust: 100%;
+
+  /* Safe-area padding zonder “dubbele” top ruimte:
+     max(...) voorkomt dat je 16px + 44px krijgt op iPhone; het wordt dan 44px. */
+  padding-top: max(16px, var(--safe-top));
+  padding-right: max(16px, var(--safe-right));
+  padding-bottom: max(16px, var(--safe-bottom));
+  padding-left: max(16px, var(--safe-left));
+
+  box-sizing: border-box;
 }
+
+* {
+  box-sizing: border-box;
+}
+
 a {
   color: #2aa8ff;
+  text-decoration: none;
+}
+
+/* Basic app layout */
+.app {
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+/* Kleine mobile polish */
+h1 {
+  margin: 0 0 12px 0;
+  font-size: 42px;
+  line-height: 1.1;
+}
+
+h2 {
+  margin: 22px 0 10px 0;
+  font-size: 28px;
+  line-height: 1.2;
+}
+
+@media (max-width: 480px) {
+  h1 {
+    font-size: 36px;
+  }
+  h2 {
+    font-size: 24px;
+  }
 }

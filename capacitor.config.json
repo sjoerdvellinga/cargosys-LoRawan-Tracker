@@ -1,0 +1,16 @@
+{
+  "appId": "org.cargosys.iot",
+  "appName": "CargoSys IoT",
+  "webDir": "dist",
+  "server": {
+    "iosScheme": "https",
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "Keyboard": {
+      "resize": "body",
+      "style": "dark",
+      "resizeOnFullScreen": true
+    }
+  }
+}
